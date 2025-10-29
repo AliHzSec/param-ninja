@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys
 import argparse
-import urllib.parse
-import tempfile
-import subprocess
 import os
-from typing import List, Optional, Generator
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from typing import Generator, List, Optional
 
 
 class Colors:
@@ -233,11 +233,14 @@ class URLFuzzer:
         if not self.silent and cleaned > 0:
             Logger.success(f"Removed {cleaned} temporary files")
 
-    def chunk_parameters(self, params: dict) -> Generator[dict, None, None]:
-        """Chunk parameters efficiently using generators"""
+    def chunk_parameters(self, params: dict, existing_count: int = 0) -> Generator[dict, None, None]:
+        """Chunk parameters efficiently using generators, accounting for existing parameters"""
         items = list(params.items())
-        for i in range(0, len(items), self.chunk_size):
-            yield dict(items[i : i + self.chunk_size])
+        # Calculate how many new parameters we can add per chunk
+        available_slots = max(1, self.chunk_size - existing_count)
+
+        for i in range(0, len(items), available_slots):
+            yield dict(items[i : i + available_slots])
 
     def _generate_normal(
         self,
@@ -262,7 +265,7 @@ class URLFuzzer:
         self,
         processed_urls: List[urllib.parse.ParseResult],
         values: List[str],
-        value_strategy: str,
+        value_strategies: List[str],
     ) -> Generator[str, None, None]:
         """Generate URLs based on 'combine' strategy"""
         for url in processed_urls:
@@ -275,21 +278,19 @@ class URLFuzzer:
 
                 for value in values:
                     for param in query_params.keys():
-                        new_query = query_params.copy()
+                        for strategy in value_strategies:
+                            new_query = query_params.copy()
 
-                        if value_strategy == "replace":
-                            new_query[param] = [value]
-                        elif value_strategy == "suffix":
-                            new_query[param] = [v + value for v in query_params[param]]
+                            if strategy == "replace":
+                                new_query[param] = [value]
+                            elif strategy == "suffix":
+                                new_query[param] = [v + value for v in query_params[param]]
+                            elif strategy == "prefix":
+                                new_query[param] = [value + v for v in query_params[param]]
+
                             query_string = urllib.parse.urlencode(new_query, doseq=True)
                             new_url = base_url._replace(query=query_string)
                             yield urllib.parse.urlunparse(new_url)
-
-                            new_query[param] = [value + v for v in query_params[param]]
-
-                        query_string = urllib.parse.urlencode(new_query, doseq=True)
-                        new_url = base_url._replace(query=query_string)
-                        yield urllib.parse.urlunparse(new_url)
             except Exception as e:
                 Logger.error(f"URL generation failed in combine strategy: {e}")
 
@@ -304,13 +305,14 @@ class URLFuzzer:
             for url in processed_urls:
                 try:
                     base_query = urllib.parse.parse_qs(url.query)
+                    existing_count = len(base_query)
                     additional_params = {param: [value] for param in params if param not in base_query}
 
                     # Skip if no new parameters to add
                     if not additional_params:
                         continue
 
-                    for chunked_additional in self.chunk_parameters(additional_params):
+                    for chunked_additional in self.chunk_parameters(additional_params, existing_count):
                         combined_query = {**base_query, **chunked_additional}
                         new_query = urllib.parse.urlencode(combined_query, doseq=True)
                         new_url = url._replace(query=new_query)
@@ -320,64 +322,62 @@ class URLFuzzer:
 
     def generate_urls_to_disk(
         self,
-        strategy: str,
+        strategies: List[str],
         urls: List[str],
         values: List[str],
-        params_file: Optional[str] = None,
-        value_strategy: Optional[str] = None,
+        params: Optional[List[str]] = None,
+        value_strategies: Optional[List[str]] = None,
     ) -> List[str]:
         """Generate URLs and write to disk, return list of temp files"""
         processed_urls = self.preprocess_urls(urls)
         if not processed_urls:
             Logger.fatal("No valid URLs to process")
 
-        # Load parameters if needed
-        params = []
-        if params_file and strategy in ["ignore", "normal", "all"]:
-            params = self.load_file(params_file)
-            if not self.silent:
-                Logger.info(f"Loaded {len(params)} parameters from file")
-
         temp_files = []
 
-        # Generate URLs based on strategy and write to separate temp files
-        if strategy == "normal":
-            if not self.silent:
-                Logger.info("Starting URL generation with 'normal' strategy")
-            generator = self._generate_normal(processed_urls, values, params)
-            temp_files.append(self.write_to_temp_file(generator, "normal"))
+        # Generate URLs based on each strategy and write to separate temp files
+        for strategy in strategies:
+            if strategy == "normal":
+                if not params:
+                    Logger.fatal("Parameters are required for 'normal' strategy")
+                if not self.silent:
+                    Logger.info("Starting URL generation with 'normal' strategy")
+                generator = self._generate_normal(processed_urls, values, params)
+                temp_files.append(self.write_to_temp_file(generator, "normal"))
 
-        elif strategy == "combine":
-            if not value_strategy:
-                Logger.fatal("Value strategy is required for 'combine' strategy")
+            elif strategy == "combine":
+                if not value_strategies:
+                    Logger.fatal("Value strategy is required for 'combine' strategy")
+                if not self.silent:
+                    Logger.info("Starting URL generation with 'combine' strategy")
+                generator = self._generate_combine(processed_urls, values, value_strategies)
+                temp_files.append(self.write_to_temp_file(generator, "combine"))
 
-            if not self.silent:
-                Logger.info("Starting URL generation with 'combine' strategy")
-            generator = self._generate_combine(processed_urls, values, value_strategy)
-            temp_files.append(self.write_to_temp_file(generator, "combine"))
+            elif strategy == "ignore":
+                if not params:
+                    Logger.fatal("Parameters are required for 'ignore' strategy")
+                if not self.silent:
+                    Logger.info("Starting URL generation with 'ignore' strategy")
+                generator = self._generate_ignore(processed_urls, values, params)
+                temp_files.append(self.write_to_temp_file(generator, "ignore"))
 
-        elif strategy == "ignore":
-            if not self.silent:
-                Logger.info("Starting URL generation with 'ignore' strategy")
-            generator = self._generate_ignore(processed_urls, values, params)
-            temp_files.append(self.write_to_temp_file(generator, "ignore"))
+            elif strategy == "all":
+                if not value_strategies:
+                    Logger.fatal("Value strategy is required for 'all' strategy")
+                if not params:
+                    Logger.fatal("Parameters are required for 'all' strategy")
+                if not self.silent:
+                    Logger.info("Starting URL generation with 'all' strategy (combine + ignore + normal)")
 
-        elif strategy == "all":
-            if not value_strategy:
-                Logger.fatal("Value strategy is required for 'all' strategy")
+                # Generate each strategy to separate file
+                generator = self._generate_combine(processed_urls, values, value_strategies)
+                temp_files.append(self.write_to_temp_file(generator, "combine"))
 
-            if not self.silent:
-                Logger.info("Starting URL generation with 'all' strategy (combine + ignore + normal)")
+                generator = self._generate_ignore(processed_urls, values, params)
+                temp_files.append(self.write_to_temp_file(generator, "ignore"))
 
-            # Generate each strategy to separate file
-            generator = self._generate_combine(processed_urls, values, value_strategy)
-            temp_files.append(self.write_to_temp_file(generator, "combine"))
-
-            generator = self._generate_ignore(processed_urls, values, params)
-            temp_files.append(self.write_to_temp_file(generator, "ignore"))
-
-            generator = self._generate_normal(processed_urls, values, params)
-            temp_files.append(self.write_to_temp_file(generator, "normal"))
+                generator = self._generate_normal(processed_urls, values, params)
+                temp_files.append(self.write_to_temp_file(generator, "normal"))
 
         return temp_files
 
@@ -422,7 +422,7 @@ def print_configuration(args, links_count: int, values_count: int, params_count:
     print(f"Input URLs      : {links_count}", file=sys.stderr)
 
     # Values source
-    if args.values_inline:
+    if args.values:
         print(f"Values Source   : Inline arguments", file=sys.stderr)
     else:
         print(f"Values Source   : File ({args.values_file})", file=sys.stderr)
@@ -431,85 +431,170 @@ def print_configuration(args, links_count: int, values_count: int, params_count:
 
     # Parameters
     if args.parameters:
-        print(f"Parameters File : {args.parameters}", file=sys.stderr)
+        print(f"Parameters      : Inline arguments", file=sys.stderr)
+        print(f"Parameters Count: {params_count}", file=sys.stderr)
+    elif args.parameters_file:
+        print(f"Parameters      : File ({args.parameters_file})", file=sys.stderr)
         print(f"Parameters Count: {params_count}", file=sys.stderr)
     else:
-        print(f"Parameters File : None", file=sys.stderr)
+        print(f"Parameters      : None", file=sys.stderr)
 
     # Strategy
-    print(f"Strategy        : {args.generate_strategy}", file=sys.stderr)
+    print(f"Generate Strategy: {', '.join(args.generate_strategy)}", file=sys.stderr)
 
     if args.value_strategy:
-        print(f"Value Strategy  : {args.value_strategy}", file=sys.stderr)
+        print(f"Value Strategy   : {', '.join(args.value_strategy)}", file=sys.stderr)
 
-    print(f"Chunk Size      : {args.chunk}", file=sys.stderr)
+    print(f"Chunk Size       : {args.chunk}", file=sys.stderr)
 
     # Output
     if output_file:
-        print(f"Output          : {output_file}", file=sys.stderr)
+        print(f"Output           : {output_file}", file=sys.stderr)
     else:
-        print(f"Output          : stdout", file=sys.stderr)
+        print(f"Output           : stdout", file=sys.stderr)
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", file=sys.stderr)
 
 
+def parse_comma_separated(value: str) -> List[str]:
+    """Parse comma-separated values into a list"""
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def main():
     """Main function to parse arguments and execute the script"""
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description="Param Ninja - Advanced URL Parameter Fuzzing Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Strategy Descriptions:
+  normal   : Generate new URLs with only the specified parameters and values
+  combine  : Inject values into existing URL parameters
+  ignore   : Add new parameters to existing URLs, ignoring duplicates
+  all      : Execute all three strategies (normal, combine, ignore)
 
-    # Input URL/URLs
+Value Strategy Descriptions:
+  replace  : Replace parameter values entirely with the injection value
+  suffix   : Append injection value to the end of existing parameter values
+  prefix   : Prepend injection value to the beginning of existing parameter values
+  all      : Apply all three value strategies (replace, suffix, prefix)
+
+Notes:
+  - Multiple strategies can be specified using comma separation (e.g., normal,combine)
+  - Multiple value strategies can be specified using comma separation (e.g., replace,suffix)
+  - Values containing special characters should be enclosed in quotes
+  - Chunk size includes existing parameters in the URL
+""",
+    )
+
+    # ============================================================================
+    # INPUT SOURCE
+    # ============================================================================
     url_group = parser.add_mutually_exclusive_group(required=True)
-    url_group.add_argument("-u", "--url", help="Single URL")
-    url_group.add_argument("-l", "--url_list", help="File containing URLs (one per line)")
+    url_group.add_argument("-u", "--url", metavar="URL", help="Single target URL to fuzz")
+    url_group.add_argument("-U", "--url-list", metavar="FILE", dest="url_list", help="File containing list of URLs (one per line)")
 
-    # Strategy
+    # ============================================================================
+    # GENERATION STRATEGY
+    # ============================================================================
     parser.add_argument(
         "-gs",
-        "--generate_strategy",
+        "--generate-strategy",
+        metavar="STRATEGY",
+        dest="generate_strategy",
         required=True,
-        choices=["all", "combine", "normal", "ignore"],
-        help="URL generation strategy",
+        type=parse_comma_separated,
+        help="URL generation strategy: all, combine, normal, ignore (comma-separated for multiple)",
     )
+
+    # ============================================================================
+    # VALUE STRATEGY
+    # ============================================================================
     parser.add_argument(
         "-vs",
-        "--value_strategy",
-        choices=["replace", "suffix"],
-        help="Value application strategy (required for 'all' and 'combine')",
+        "--value-strategy",
+        metavar="STRATEGY",
+        dest="value_strategy",
+        type=parse_comma_separated,
+        help="Value injection strategy: replace, suffix, prefix, all (comma-separated for multiple). Required for 'combine' and 'all' strategies",
     )
 
-    # Values
+    # ============================================================================
+    # VALUES INPUT
+    # ============================================================================
     value_group = parser.add_mutually_exclusive_group(required=True)
-    value_group.add_argument("-v", "--values_inline", nargs="+", help="Values provided as inline arguments")
-    value_group.add_argument("-vf", "--values_file", help="File containing values (one per line)")
+    value_group.add_argument("-v", "--values", metavar="VALUE", nargs="+", help="Injection values provided as inline arguments (quote values with special characters)")
+    value_group.add_argument("-V", "--values-file", metavar="FILE", dest="values_file", help="File containing injection values (one per line)")
 
-    # Parameters
-    parser.add_argument(
+    # ============================================================================
+    # PARAMETERS INPUT
+    # ============================================================================
+    param_group = parser.add_mutually_exclusive_group()
+    param_group.add_argument(
         "-p",
         "--parameters",
-        help="File containing parameters (required for 'ignore', 'normal', and 'all' strategies)",
+        metavar="PARAM",
+        type=parse_comma_separated,
+        help="Parameter names provided as inline arguments (comma-separated). Required for 'normal', 'ignore', and 'all' strategies",
+    )
+    param_group.add_argument(
+        "-P",
+        "--parameters-file",
+        metavar="FILE",
+        dest="parameters_file",
+        help="File containing parameter names (one per line). Required for 'normal', 'ignore', and 'all' strategies",
     )
 
-    # Options
-    parser.add_argument("-c", "--chunk", type=int, default=25, help="Number of parameters per URL chunk")
+    # ============================================================================
+    # OPTIONS
+    # ============================================================================
+    parser.add_argument(
+        "-c", "--chunk", metavar="N", type=int, default=25, help="Maximum number of parameters per generated URL (default: 25). Includes existing parameters in the URL"
+    )
     parser.add_argument(
         "-o",
         "--output",
+        metavar="FILE",
         nargs="?",
         const="",
         default=None,
-        help="Output file (if no filename provided, auto-generates based on input)",
+        help="Output file path. If flag provided without filename, auto-generates based on input. If omitted, outputs to stdout",
     )
     parser.add_argument("-s", "--silent", action="store_true", help="Silent mode - suppress banner and progress messages")
-    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files for debugging")
+    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files after execution for debugging purposes")
 
     args = parser.parse_args()
 
-    # Parameter validation
-    if args.generate_strategy in ["ignore", "normal", "all"] and not args.parameters:
-        Logger.fatal(f"Parameter file (-p) is required for '{args.generate_strategy}' strategy")
+    # ============================================================================
+    # PARAMETER VALIDATION
+    # ============================================================================
 
-    if args.generate_strategy in ["combine", "all"] and not args.value_strategy:
-        Logger.fatal(f"Value strategy (-vs) is required for '{args.generate_strategy}' strategy")
+    # Validate generate_strategy values
+    valid_gen_strategies = {"all", "combine", "normal", "ignore"}
+    for strategy in args.generate_strategy:
+        if strategy not in valid_gen_strategies:
+            Logger.fatal(f"Invalid generate strategy: '{strategy}'. Must be one of: {', '.join(valid_gen_strategies)}")
+
+    # Validate value_strategy values if provided
+    if args.value_strategy:
+        valid_val_strategies = {"replace", "suffix", "prefix", "all"}
+        for strategy in args.value_strategy:
+            if strategy not in valid_val_strategies:
+                Logger.fatal(f"Invalid value strategy: '{strategy}'. Must be one of: {', '.join(valid_val_strategies)}")
+
+        # Expand 'all' to all value strategies
+        if "all" in args.value_strategy:
+            args.value_strategy = ["replace", "suffix", "prefix"]
+
+    # Check if parameters are required
+    requires_params = any(s in args.generate_strategy for s in ["ignore", "normal", "all"])
+    if requires_params and not args.parameters and not args.parameters_file:
+        Logger.fatal(f"Parameters (-p or -P) are required for strategies: {', '.join([s for s in args.generate_strategy if s in ['ignore', 'normal', 'all']])}")
+
+    # Check if value strategy is required
+    requires_value_strategy = any(s in args.generate_strategy for s in ["combine", "all"])
+    if requires_value_strategy and not args.value_strategy:
+        Logger.fatal(f"Value strategy (-vs) is required for strategies: {', '.join([s for s in args.generate_strategy if s in ['combine', 'all']])}")
 
     # Print banner if not in silent mode
     if not args.silent:
@@ -526,15 +611,19 @@ def main():
             links = fuzzer.load_file(args.url_list)
 
         # Get values from inline arguments or file
-        if args.values_inline:
-            values = args.values_inline
+        if args.values:
+            values = args.values
         else:
             values = fuzzer.load_file(args.values_file)
 
-        # Get parameters count if file provided
+        # Get parameters from inline arguments or file
+        params = None
         params_count = 0
         if args.parameters:
-            params = fuzzer.load_file(args.parameters)
+            params = args.parameters
+            params_count = len(params)
+        elif args.parameters_file:
+            params = fuzzer.load_file(args.parameters_file)
             params_count = len(params)
 
         # Determine output file
@@ -548,11 +637,11 @@ def main():
             Logger.info("Starting URL generation process...")
 
         temp_files = fuzzer.generate_urls_to_disk(
-            strategy=args.generate_strategy,
+            strategies=args.generate_strategy,
             urls=links,
             values=values,
-            params_file=args.parameters,
-            value_strategy=args.value_strategy,
+            params=params,
+            value_strategies=args.value_strategy,
         )
 
         if not temp_files:
@@ -563,11 +652,6 @@ def main():
             Logger.info("Starting deduplication process...")
 
         sorted_files = []
-        strategy_names = {
-            "normal": "normal",
-            "combine": "combine",
-            "ignore": "ignore",
-        }
 
         for i, temp_file in enumerate(temp_files):
             # Determine strategy name from temp file
